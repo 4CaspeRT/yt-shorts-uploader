@@ -1,85 +1,113 @@
 import os
 import json
-import time
-from datetime import datetime, timedelta
+import pickle
+import base64
+import datetime
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 from apscheduler.schedulers.blocking import BlockingScheduler
 
-# Scopes for Google APIs
+# Set scopes
 SCOPES = [
-    "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/drive"
+    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/youtube.upload'
 ]
 
-# Step 1: Reconstruct credential files from environment variables
-def write_credentials_from_env():
-    creds_json = os.getenv("CREDENTIALS_JSON")
-    token_json = os.getenv("TOKEN_JSON")
+# Load creds/token from environment (base64 encoded)
+def load_credentials():
+    creds = None
 
-    if creds_json:
+    # Load and write credentials.json
+    cred_json_b64 = os.environ.get("CREDENTIALS_JSON")
+    if cred_json_b64:
+        cred_json = base64.b64decode(cred_json_b64).decode()
         with open("credentials.json", "w") as f:
-            f.write(creds_json)
-    else:
-        raise Exception("CREDENTIALS_JSON environment variable is missing!")
+            f.write(cred_json)
 
-    if token_json:
+    # Load token.json or get new one
+    token_json_b64 = os.environ.get("TOKEN_JSON")
+    if token_json_b64:
+        token_json = base64.b64decode(token_json_b64).decode()
         with open("token.json", "w") as f:
             f.write(token_json)
-    else:
-        raise Exception("TOKEN_JSON environment variable is missing!")
 
-# Step 2: Authenticate with YouTube and Drive
-def get_authenticated_services():
-    write_credentials_from_env()
-
-    creds = None
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_console()
-
-        with open("token.json", "w") as token:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES
+            )
+            creds = flow.run_console()  # Use `run_console()` in headless server
+        with open('token.json', 'w') as token:
             token.write(creds.to_json())
 
-    youtube = build("youtube", "v3", credentials=creds)
-    drive = build("drive", "v3", credentials=creds)
-    return drive, youtube
+    return creds
 
-# Dummy function to simulate upload (replace with your actual logic)
-def upload_to_youtube(video_path, title, description, tags, publish_time):
-    try:
-        print(f"Uploading: {video_path}")
-        # Your upload logic goes here...
-        # ...
-        print("✅ Upload successful!")
-    except HttpError as e:
-        print(f"❌ Upload failed: {e}")
+# Get services
+def get_authenticated_services():
+    creds = load_credentials()
+    drive_service = build('drive', 'v3', credentials=creds)
+    youtube_service = build('youtube', 'v3', credentials=creds)
+    return drive_service, youtube_service
 
-# Scheduler logic
-def job():
-    now = datetime.now()
-    publish_time = (now + timedelta(minutes=5)).isoformat("T") + "Z"
-    upload_to_youtube(
-        "videos/example.mp4",
-        "My YouTube Short Title",
-        "My video description",
-        ["shorts", "example"],
-        publish_time
-    )
+# Your uploading logic
+def upload_latest_video():
+    print(f"[{datetime.datetime.now()}] Upload job started...")
 
-if __name__ == "__main__":
-    try:
-        drive, youtube = get_authenticated_services()
-        scheduler = BlockingScheduler()
-        scheduler.add_job(job, "interval", hours=1)
-        scheduler.start()
-    except Exception as e:
-        print(f"⚠️ Error: {e}")
+    drive, youtube = get_authenticated_services()
+
+    # Example logic
+    folder_id = 'your-drive-folder-id'  # optional
+    results = drive.files().list(
+        q="mimeType='video/mp4'",
+        pageSize=1,
+        orderBy="createdTime desc",
+        fields="files(id, name)"
+    ).execute()
+
+    items = results.get('files', [])
+    if not items:
+        print("No video found.")
+        return
+
+    video_file = items[0]
+    file_id = video_file['id']
+    file_name = video_file['name']
+    request = drive.files().get_media(fileId=file_id)
+    fh = open(file_name, "wb")
+    downloader = drive._http.request("GET", f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media")
+    fh.write(downloader.data)
+    fh.close()
+
+    print(f"Uploading {file_name} to YouTube...")
+    request_body = {
+        'snippet': {
+            'title': file_name,
+            'description': 'Automated upload',
+            'tags': ['shorts'],
+            'categoryId': '22'
+        },
+        'status': {
+            'privacyStatus': 'public',
+            'selfDeclaredMadeForKids': False,
+        }
+    }
+
+    media_file = MediaFileUpload(file_name, resumable=True, mimetype='video/mp4')
+    response = youtube.videos().insert(
+        part='snippet,status',
+        body=request_body,
+        media_body=media_file
+    ).execute()
+
+    print(f"Uploaded: https://youtu.be/{response['id']}")
+
+# Schedule (optional, for local testing)
+if __name__ == '__main__':
+    upload_latest_video()
