@@ -1,46 +1,49 @@
 import os
-import base64
+import io
 import json
 import logging
-import time
+import base64
+from datetime import datetime
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
-import io
+from googleapiclient.errors import HttpError
+from oauth2client.file import Storage
+from oauth2client.tools import run_flow
+from oauth2client.client import flow_from_clientsecrets
 
-# Setup logging
-logging.basicConfig(
-    format='[%(asctime)s] %(message)s',
-    level=logging.INFO,
-    datefmt='%Y-%m-%d %H:%M:%S',
-)
-
+# === CONFIGURATION ===
 FOLDER_ID = '1S53xGR45LjWhbwcfTJgOK4zOWkSQFtUA'  # Your Google Drive folder ID
+STATIC_DESCRIPTION = "🔥 Subscribe for more awesome content!\n📌 Follow us for daily shorts.\n#Shorts #Trending"
+STATIC_TAGS = ["Shorts", "Trending", "DailyContent", "Viral"]
+LOCAL_FOLDER = '.'  # Where to temporarily save videos
+
+logging.basicConfig(format='[%(asctime)s] %(message)s', level=logging.INFO)
 
 def load_credentials():
-    credentials_json = os.environ.get('CREDENTIALS_JSON')
-    token_json = os.environ.get('TOKEN_JSON')
+    credentials_json = os.getenv("CREDENTIALS_JSON")
+    token_json = os.getenv("TOKEN_JSON")
 
-    if not credentials_json or not token_json:
-        raise Exception("Environment variables for credentials or token are missing.")
+    if credentials_json and token_json:
+        creds_data = json.loads(base64.b64decode(credentials_json))
+        token_data = json.loads(base64.b64decode(token_json))
+        creds = Credentials.from_authorized_user_info(token_data)
+        return creds
 
-    creds_data = json.loads(base64.b64decode(credentials_json))
-    token_data = json.loads(base64.b64decode(token_json))
+    # Fallback to local credentials
+    if os.path.exists("credentials.json"):
+        flow = flow_from_clientsecrets("credentials.json", scopes=[
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/youtube.upload",
+            "https://www.googleapis.com/auth/youtube"
+        ])
+        storage = Storage("token.json")
+        creds = storage.get()
+        if not creds or creds.invalid:
+            creds = run_flow(flow, storage)
+        return creds
 
-    creds = Credentials(
-        token=token_data['token'],
-        refresh_token=token_data.get('refresh_token'),
-        token_uri=creds_data['installed']['token_uri'],
-        client_id=creds_data['installed']['client_id'],
-        client_secret=creds_data['installed']['client_secret'],
-        scopes=[
-            'https://www.googleapis.com/auth/drive.readonly',
-            'https://www.googleapis.com/auth/youtube.upload',
-            'https://www.googleapis.com/auth/youtube'
-        ]
-    )
-    return creds
+    raise Exception("Environment variables for credentials or token are missing.")
 
 def get_authenticated_services():
     creds = load_credentials()
@@ -49,84 +52,83 @@ def get_authenticated_services():
     return drive, youtube
 
 def get_latest_video_file(drive):
-    results = (
-        drive.files()
-        .list(
-            q=f"'{FOLDER_ID}' in parents and mimeType='video/mp4'",
-            orderBy='createdTime desc',
-            pageSize=1,
-            fields='files(id, name)',
-        )
-        .execute()
-    )
+    results = drive.files().list(
+        q=f"'{FOLDER_ID}' in parents and mimeType='video/mp4'",
+        orderBy='createdTime desc',
+        pageSize=1,
+        fields="files(id, name)"
+    ).execute()
     items = results.get('files', [])
     if not items:
-        raise Exception("No video files found in the folder.")
+        raise Exception("No video files found in the Drive folder.")
     return items[0]['id'], items[0]['name']
 
 def download_file(drive, file_id, file_name):
-    logging.info(f"📥 Downloading {file_name} from Drive...")
     request = drive.files().get_media(fileId=file_id)
     fh = io.FileIO(file_name, 'wb')
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
         status, done = downloader.next_chunk()
-        if status:
-            logging.info(f"⬇️ Download progress: {int(status.progress() * 100)}%")
-    return file_name
+        logging.info("⬇️ Download progress: %d%%" % int(status.progress() * 100))
 
-def upload_to_youtube(youtube, file_path):
-    title = os.path.splitext(os.path.basename(file_path))[0]
+def upload_video(youtube, file_name, title):
     body = {
         'snippet': {
             'title': title,
-            'description': 'Uploaded via automation.',
-            'tags': ['shorts'],
-            'categoryId': '22',
+            'description': STATIC_DESCRIPTION,
+            'tags': STATIC_TAGS,
+            'categoryId': '22'  # 'People & Blogs'
         },
         'status': {
             'privacyStatus': 'public',
             'selfDeclaredMadeForKids': False,
-        },
+        }
     }
-    media = MediaFileUpload(file_path, mimetype='video/*', resumable=True)
-    request = youtube.videos().insert(part='snippet,status', body=body, media_body=media)
-
+    media = MediaFileUpload(file_name, resumable=True, chunksize=-1)
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     response = None
     while response is None:
         try:
             status, response = request.next_chunk()
-            if status:
-                logging.info(f"📤 Upload progress: {int(status.progress() * 100)}%")
         except HttpError as e:
-            if e.resp.status in [403, 500, 503]:
-                logging.warning("Retrying after error...")
-                time.sleep(5)
-            else:
-                raise
-    logging.info(f"✅ Uploaded: https://youtu.be/{response['id']}")
-    return response['id']
+            logging.error(f"❌ Upload failed: {e}")
+            return None
+    return response.get('id')
+
+def delete_file_from_drive(drive, file_id):
+    try:
+        drive.files().delete(fileId=file_id).execute()
+        logging.info("🗑️ Deleted video from Google Drive.")
+    except HttpError as e:
+        if e.resp.status == 403:
+            logging.warning("⚠️ Failed to delete video from Drive: %s", e)
+        else:
+            raise
+
+def delete_local_file(file_name):
+    try:
+        os.remove(file_name)
+        logging.info("🗑️ Deleted local file.")
+    except Exception as e:
+        logging.warning("⚠️ Failed to delete local file: %s", e)
 
 def upload_latest_video():
     logging.info("Upload job started...")
     drive, youtube = get_authenticated_services()
     file_id, file_name = get_latest_video_file(drive)
-    file_path = download_file(drive, file_id, file_name)
-    try:
-        upload_to_youtube(youtube, file_path)
-    except Exception as e:
-        logging.error(f"❌ Failed to upload: {e}")
-    try:
-        drive.files().delete(fileId=file_id).execute()
-        logging.info("🗑️ Deleted video from Google Drive.")
-    except Exception as e:
-        logging.warning(f"⚠️ Failed to delete video from Drive: {e}")
-    try:
-        os.remove(file_path)
-        logging.info("🗑️ Deleted local file.")
-    except Exception as e:
-        logging.warning(f"⚠️ Failed to delete local file: {e}")
 
-if __name__ == '__main__':
+    logging.info(f"📥 Downloading {file_name} from Drive...")
+    download_file(drive, file_id, file_name)
+
+    title = os.path.splitext(file_name)[0]
+    logging.info(f"📤 Uploading {file_name} to YouTube...")
+    video_id = upload_video(youtube, file_name, title)
+    if video_id:
+        logging.info(f"✅ Uploaded: https://youtu.be/{video_id}")
+
+    delete_file_from_drive(drive, file_id)
+    delete_local_file(file_name)
+
+if __name__ == "__main__":
     upload_latest_video()
