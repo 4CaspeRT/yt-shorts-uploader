@@ -1,129 +1,122 @@
 import os
-import json
+import io
 import base64
-import datetime
-from google.auth.transport.requests import Request
+import json
+import logging
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-# 🔐 Updated SCOPES: Full Drive access (not read-only)
-SCOPES = [
-    'https://www.googleapis.com/auth/drive',
-    'https://www.googleapis.com/auth/youtube.upload'
-]
+logging.basicConfig(format='[%(asctime)s] %(message)s', level=logging.INFO)
 
-# 📦 Load credentials from environment (on server) or from file (locally)
+FOLDER_ID = '1S53xGR45LjWhbwcfTJgOK4zOWkSQFtUA'  # Replace with your actual folder ID
+
 def load_credentials():
-    creds = None
+    credentials_json = os.environ.get("CREDENTIALS_JSON")
+    token_json = os.environ.get("TOKEN_JSON")
 
-    # Decode and save credentials.json from environment if available
-    cred_b64 = os.environ.get("CREDENTIALS_JSON")
-    if cred_b64:
-        with open("credentials.json", "w") as f:
-            f.write(base64.b64decode(cred_b64).decode())
+    if not credentials_json or not token_json:
+        raise Exception("Environment variables for credentials or token are missing.")
 
-    # Decode and save token.json from environment if available
-    token_b64 = os.environ.get("TOKEN_JSON")
-    if token_b64:
-        with open("token.json", "w") as f:
-            f.write(base64.b64decode(token_b64).decode())
+    creds_data = json.loads(base64.b64decode(credentials_json))
+    token_data = json.loads(base64.b64decode(token_json))
 
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        with open("token.json", "w") as token_file:
-            token_file.write(creds.to_json())
-
-    if not creds or not creds.valid or not creds.refresh_token:
-        raise Exception("Valid token.json with refresh_token is required on server.")
+    creds = Credentials.from_authorized_user_info(info=token_data)
+    if creds.expired or not creds.valid:
+        creds = Credentials(
+            token=None,
+            refresh_token=token_data.get("refresh_token"),
+            token_uri=creds_data["installed"]["token_uri"],
+            client_id=creds_data["installed"]["client_id"],
+            client_secret=creds_data["installed"]["client_secret"],
+            scopes=[
+                "https://www.googleapis.com/auth/drive.readonly",
+                "https://www.googleapis.com/auth/youtube.upload",
+                "https://www.googleapis.com/auth/youtube"
+            ]
+        )
+        creds.refresh(Request())
 
     return creds
 
-# 🔑 Get Drive and YouTube service objects
 def get_authenticated_services():
     creds = load_credentials()
-    drive_service = build("drive", "v3", credentials=creds)
-    youtube_service = build("youtube", "v3", credentials=creds)
-    return drive_service, youtube_service
+    drive = build("drive", "v3", credentials=creds)
+    youtube = build("youtube", "v3", credentials=creds)
+    return drive, youtube
 
-# 🚀 Upload logic
-def upload_latest_video():
-    print(f"[{datetime.datetime.now()}] Upload job started...")
-
-    drive, youtube = get_authenticated_services()
-
-    # 🔍 Search in specific Google Drive folder
-    folder_id = "1S53xGR45LjWhbwcfTJgOK4zOWkSQFtUA"
-    query = f"'{folder_id}' in parents and mimeType='video/mp4'"
+def get_latest_video_file(drive):
     results = drive.files().list(
-        q=query,
-        pageSize=1,
+        q=f"'{FOLDER_ID}' in parents and mimeType='video/mp4'",
         orderBy="createdTime desc",
+        pageSize=1,
         fields="files(id, name)"
     ).execute()
-
     files = results.get("files", [])
     if not files:
-        print("No video found in Drive.")
-        return
+        raise Exception("No video files found in the Drive folder.")
+    return files[0]["id"], files[0]["name"]
 
-    video = files[0]
-    file_id = video["id"]
-    file_name = video["name"]
-
-    print(f"📥 Downloading {file_name} from Drive...")
+def download_file(drive, file_id, file_name):
+    logging.info(f"📥 Downloading {file_name} from Drive...")
     request = drive.files().get_media(fileId=file_id)
-    with open(file_name, "wb") as f:
-        downloader = drive._http.request("GET", f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media")
-        f.write(downloader.data)
-    print("⬇️ Download progress: 100%")
+    fh = io.FileIO(file_name, 'wb')
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+        logging.info(f"⬇️ Download progress: {int(status.progress() * 100)}%")
 
-    print(f"📤 Uploading {file_name} to YouTube...")
-    request_body = {
-        "snippet": {
-            "title": file_name,
-            "description": "Automated upload",
-            "tags": ["shorts"],
-            "categoryId": "22"
-        },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False
-        }
-    }
-
-    media_file = MediaFileUpload(file_name, mimetype="video/mp4", resumable=True)
-    upload_request = youtube.videos().insert(
+def upload_to_youtube(youtube, file_name):
+    logging.info(f"📤 Uploading {file_name} to YouTube...")
+    request = youtube.videos().insert(
         part="snippet,status",
-        body=request_body,
-        media_body=media_file
+        body={
+            "snippet": {
+                "title": file_name,
+                "description": "#shorts",
+                "tags": ["shorts"],
+                "categoryId": "22"
+            },
+            "status": {
+                "privacyStatus": "public"
+            }
+        },
+        media_body=MediaFileUpload(file_name, resumable=True, mimetype="video/*")
     )
-    response = upload_request.execute()
-    print(f"✅ Uploaded: https://youtu.be/{response['id']}")
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+    logging.info(f"✅ Uploaded: https://youtu.be/{response['id']}")
+    return response["id"]
 
-    # 🗑 Delete from Drive
+def delete_from_drive(drive, file_id):
     try:
         drive.files().delete(fileId=file_id).execute()
-        print(f"🗑 Deleted {file_name} from Google Drive.")
-    except Exception as e:
-        print("⚠️ Failed to delete from Drive:", e)
+        logging.info("🗑️ Deleted video from Google Drive.")
+    except HttpError as e:
+        if e.resp.status == 403:
+            logging.warning(f"⚠️ Failed to delete video from Drive: {e}")
+        else:
+            raise
 
-    # 🧹 Delete locally
+def delete_local_file(file_name):
     try:
         os.remove(file_name)
-        print(f"🧹 Deleted {file_name} from local storage.")
+        logging.info("🗑️ Deleted local file.")
     except Exception as e:
-        print("⚠️ Failed to delete local file:", e)
+        logging.warning(f"⚠️ Failed to delete local file: {e}")
 
-# 🕒 Trigger manually
+def upload_latest_video():
+    logging.info("Upload job started...")
+    drive, youtube = get_authenticated_services()
+    file_id, file_name = get_latest_video_file(drive)
+    download_file(drive, file_id, file_name)
+    upload_to_youtube(youtube, file_name)
+    delete_from_drive(drive, file_id)
+    delete_local_file(file_name)
+
 if __name__ == "__main__":
     upload_latest_video()
