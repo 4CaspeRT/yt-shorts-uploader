@@ -8,15 +8,11 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 from googleapiclient.errors import HttpError
-from oauth2client.file import Storage
-from oauth2client.tools import run_flow
-from oauth2client.client import flow_from_clientsecrets
 
-# === CONFIGURATION ===
-FOLDER_ID = '1S53xGR45LjWhbwcfTJgOK4zOWkSQFtUA'  # Your Google Drive folder ID
+FOLDER_ID = '1S53xGR45LjWhbwcfTJgOK4zOWkSQFtUA'
 STATIC_DESCRIPTION = "🔥 Subscribe for more awesome content!\n📌 Follow us for daily shorts.\n#Shorts #Trending"
 STATIC_TAGS = ["Shorts", "Trending", "DailyContent", "Viral"]
-LOCAL_FOLDER = '.'  # Where to temporarily save videos
+LOCAL_FOLDER = '.'
 
 logging.basicConfig(format='[%(asctime)s] %(message)s', level=logging.INFO)
 
@@ -28,19 +24,6 @@ def load_credentials():
         creds_data = json.loads(base64.b64decode(credentials_json))
         token_data = json.loads(base64.b64decode(token_json))
         creds = Credentials.from_authorized_user_info(token_data)
-        return creds
-
-    # Fallback to local credentials
-    if os.path.exists("credentials.json"):
-        flow = flow_from_clientsecrets("credentials.json", scopes=[
-            "https://www.googleapis.com/auth/drive.readonly",
-            "https://www.googleapis.com/auth/youtube.upload",
-            "https://www.googleapis.com/auth/youtube"
-        ])
-        storage = Storage("token.json")
-        creds = storage.get()
-        if not creds or creds.invalid:
-            creds = run_flow(flow, storage)
         return creds
 
     raise Exception("Environment variables for credentials or token are missing.")
@@ -78,7 +61,7 @@ def upload_video(youtube, file_name, title):
             'title': title,
             'description': STATIC_DESCRIPTION,
             'tags': STATIC_TAGS,
-            'categoryId': '22'  # 'People & Blogs'
+            'categoryId': '22'
         },
         'status': {
             'privacyStatus': 'public',
